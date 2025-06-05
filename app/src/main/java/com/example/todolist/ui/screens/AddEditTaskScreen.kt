@@ -1,10 +1,18 @@
 package com.example.todolist.ui.screens
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.app.DatePickerDialog
 import android.app.TimePickerDialog
+import android.content.ActivityNotFoundException
+import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
+import android.provider.OpenableColumns
+import android.provider.Settings
+import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,18 +28,83 @@ import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalLifecycleOwner
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
 import androidx.navigation.NavController
 import com.example.todolist.data.Task
 import com.example.todolist.notifications.TaskAlarmScheduler
 import com.example.todolist.viewmodel.TaskViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.filterNotNull
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.io.InputStream
 import java.text.SimpleDateFormat
 import java.util.*
 import com.example.todolist.ui.components.AddCategoryDialog
+
+fun getFileName(context: Context, uri: Uri): String {
+    var fileName: String? = null
+    if (uri.scheme == "content") {
+        try {
+            context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                    if (nameIndex != -1) {
+                        fileName = cursor.getString(nameIndex)
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("getFileName", "Error querying content resolver for display name: ${e.message}")
+        }
+    }
+    if (fileName == null) {
+        fileName = uri.path
+        val cut = fileName?.lastIndexOf('/')
+        if (cut != -1 && cut != null) {
+            fileName = fileName?.substring(cut + 1)
+        }
+    }
+    return fileName?.takeIf { it.isNotBlank() } ?: "nieznany_plik_${UUID.randomUUID()}"
+}
+
+fun generateUniqueInternalFileName(baseName: String, extension: String, directory: File): String {
+    val sanitizedBaseName = baseName.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+    val sanitizedExtension = extension.takeIf { it.isNotBlank() }?.let { "." + it.replace(Regex("[^a-zA-Z0-9]"), "") } ?: ""
+    var finalName = "$sanitizedBaseName$sanitizedExtension"
+    if (finalName.isBlank() || finalName == ".") {
+        finalName = "plik_${UUID.randomUUID()}$sanitizedExtension"
+    }
+    var counter = 1
+    var tempFile = File(directory, finalName)
+    while (tempFile.exists()) {
+        finalName = "$sanitizedBaseName ($counter)$sanitizedExtension"
+        if (finalName == "$sanitizedBaseName ($counter)$sanitizedExtension" && counter > 1 && baseName.endsWith(" ($counter-1)")) {
+            finalName = "$sanitizedBaseName$counter$sanitizedExtension"
+        }
+        tempFile = File(directory, finalName)
+        counter++
+        if (counter > 1000) {
+            Log.e("generateUniqueInternalFileName", "Could not generate a unique name after 1000 tries for $baseName")
+            return "plik_awaryjny_${UUID.randomUUID()}$sanitizedExtension"
+        }
+    }
+    return finalName
+}
+
 
 @SuppressLint("UnusedMaterial3ScaffoldPaddingParameter")
 @OptIn(ExperimentalMaterial3Api::class)
@@ -42,44 +115,73 @@ fun AddEditTaskScreen(
     taskId: Int?
 ) {
     val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
     val alarmScheduler = remember { TaskAlarmScheduler(context) }
 
     var taskToEdit by remember { mutableStateOf<Task?>(null) }
-
-    var title by remember { mutableStateOf("") }
-    var description by remember { mutableStateOf("") }
-    var selectedCategory by remember { mutableStateOf<String?>(null) }
-    var executionTime by remember { mutableStateOf<Long?>(null) }
-    var notificationEnabled by remember { mutableStateOf(false) }
-    var attachments by remember { mutableStateOf<List<String>>(emptyList()) }
+    var title by rememberSaveable { mutableStateOf("") }
+    var description by rememberSaveable { mutableStateOf("") }
+    var selectedCategory by rememberSaveable { mutableStateOf<String?>(null) }
+    var executionTime by rememberSaveable { mutableStateOf<Long?>(null) }
+    var notificationEnabledState by rememberSaveable { mutableStateOf(false) }
+    var attachments by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
 
     val isEditMode = taskId != null
     val allAvailableCategories by taskViewModel.allAvailableCategories.collectAsState()
-    var showAddCategoryDialog by remember { mutableStateOf(false) }
-
-    // Efekt do ładowania danych zadania w trybie edycji
-    LaunchedEffect(key1 = taskId) {
-        if (isEditMode && taskId != null) {
-            taskViewModel.getTaskById(taskId).filterNotNull().collect { task ->
-                taskToEdit = task
-                title = task.title
-                description = task.description ?: ""
-                selectedCategory = task.category
-                executionTime = task.executionTime
-                notificationEnabled = task.notificationEnabled
-                attachments = task.attachments
-            }
-        }
+    var showAddCategoryDialog by rememberSaveable { mutableStateOf(false) }
+    var hasNotificationPermission by rememberSaveable {
+        mutableStateOf(
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+            } else { true }
+        )
     }
 
-    // Efekt do aktualizacji selectedCategory, jeśli kategoria zadania się zmieni
-    // (np. po dodaniu nowej kategorii i automatycznym jej wybraniu)
-    LaunchedEffect(taskToEdit?.category, allAvailableCategories) {
-        if (isEditMode && taskToEdit != null) {
-            selectedCategory = taskToEdit?.category
-        } else if (!isEditMode && selectedCategory == null && allAvailableCategories.isNotEmpty() && !allAvailableCategories.contains(selectedCategory)) {
-            // Opcjonalnie: ustaw pierwszą dostępną kategorię jako domyślną dla nowego zadania
-            // selectedCategory = allAvailableCategories.firstOrNull { it != "Dodaj nową..." }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    hasNotificationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
+                }
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    LaunchedEffect(key1 = taskId) {
+        Log.d("AddEditTaskScreen", "LaunchedEffect for taskId ($taskId) triggered. isEditMode: $isEditMode")
+        if (taskId != null) {
+            Log.i("AddEditTaskScreen", "EDIT MODE - Subscribing to task with ID: $taskId")
+            taskViewModel.getTaskById(taskId).collectLatest { loadedTask ->
+                if (loadedTask != null) {
+                    Log.i("AddEditTaskScreen", "EDIT MODE - Received task data: ${loadedTask.title}, attachments: ${loadedTask.attachments.size}")
+                    taskToEdit = loadedTask
+                    title = loadedTask.title
+                    description = loadedTask.description ?: ""
+                    selectedCategory = loadedTask.category
+                    executionTime = loadedTask.executionTime
+                    notificationEnabledState = loadedTask.notificationEnabled
+                    attachments = loadedTask.attachments
+                } else {
+                    Log.w("AddEditTaskScreen", "EDIT MODE - Task with ID $taskId not found or is null. Clearing fields.")
+                    taskToEdit = null
+                    title = ""
+                    description = ""
+                    selectedCategory = null
+                    executionTime = null
+                    notificationEnabledState = false
+                    attachments = emptyList()
+                }
+            }
+        } else {
+            Log.i("AddEditTaskScreen", "ADD MODE - Initializing for new task.")
+            if (taskToEdit == null && title.isEmpty() && description.isEmpty() && attachments.isEmpty() && selectedCategory == null && executionTime == null && !notificationEnabledState) {
+                Log.d("AddEditTaskScreen", "ADD MODE - Fields are empty, ensuring default empty values.")
+            } else {
+                Log.d("AddEditTaskScreen", "ADD MODE - Fields might have been restored by rememberSaveable or are being edited. Title: '$title'")
+            }
         }
     }
 
@@ -87,15 +189,32 @@ fun AddEditTaskScreen(
     val filePickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris: List<Uri> ->
-        val newAttachmentUris = uris.map { uri ->
-            try {
-                context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            } catch (e: SecurityException) {
-                e.printStackTrace()
+        coroutineScope.launch {
+            val newAttachmentNames = mutableListOf<String>()
+            uris.forEach { uri ->
+                try {
+                    val attachmentsDir = File(context.filesDir, "attachments")
+                    if (!attachmentsDir.exists()) { attachmentsDir.mkdirs() }
+
+                    val originalFileNameWithExt = getFileName(context, uri)
+                    val baseName = originalFileNameWithExt.substringBeforeLast('.', originalFileNameWithExt)
+                    val extension = originalFileNameWithExt.substringAfterLast('.', "")
+                    val internalFileName = generateUniqueInternalFileName(baseName, extension, attachmentsDir)
+                    val internalFile = File(attachmentsDir, internalFileName)
+
+                    withContext(Dispatchers.IO) {
+                        context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                            FileOutputStream(internalFile).use { outputStream -> inputStream.copyTo(outputStream) }
+                        }
+                    }
+                    newAttachmentNames.add(internalFileName)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    Toast.makeText(context, "Błąd podczas kopiowania pliku: ${e.localizedMessage}", Toast.LENGTH_LONG).show()
+                }
             }
-            uri.toString()
+            attachments = attachments + newAttachmentNames
         }
-        attachments = attachments + newAttachmentUris
     }
 
     if (showAddCategoryDialog) {
@@ -103,15 +222,10 @@ fun AddEditTaskScreen(
             onDismissRequest = { showAddCategoryDialog = false },
             onConfirm = { newCategoryName ->
                 taskViewModel.addNewUserCategory(newCategoryName)
-                // Po dodaniu, nowa kategoria powinna pojawić się w allAvailableCategories
-                // i można ją automatycznie wybrać.
-                // Czekamy, aż ViewModel zaktualizuje listę i wybieramy.
-                // To może wymagać lekkiego opóźnienia lub obserwacji zmiany w allAvailableCategories.
-                // Na razie prościej:
                 selectedCategory = newCategoryName
                 showAddCategoryDialog = false
             },
-            existingCategories = allAvailableCategories // Przekaż istniejące kategorie do walidacji
+            existingCategories = allAvailableCategories
         )
     }
 
@@ -135,32 +249,15 @@ fun AddEditTaskScreen(
                 .verticalScroll(rememberScrollState()),
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            OutlinedTextField(
-                value = title,
-                onValueChange = { title = it },
-                label = { Text("Tytuł") },
-                modifier = Modifier.fillMaxWidth(),
-                singleLine = true
-            )
+            OutlinedTextField(value = title, onValueChange = { title = it }, label = { Text("Tytuł") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
             Spacer(modifier = Modifier.height(8.dp))
-            OutlinedTextField(
-                value = description,
-                onValueChange = { description = it },
-                label = { Text("Opis (opcjonalnie)") },
-                modifier = Modifier.fillMaxWidth().height(120.dp)
-            )
+            OutlinedTextField(value = description, onValueChange = { description = it }, label = { Text("Opis (opcjonalnie)") }, modifier = Modifier.fillMaxWidth().height(120.dp))
             Spacer(modifier = Modifier.height(8.dp))
 
-            // Wybór kategorii z Dropdown
-            var categoryMenuExpanded by remember { mutableStateOf(false) }
+            var categoryMenuExpanded by rememberSaveable { mutableStateOf(false) }
             val specialOptionAddNew = "Dodaj nową..."
-
-            ExposedDropdownMenuBox(
-                expanded = categoryMenuExpanded,
-                onExpandedChange = { categoryMenuExpanded = !categoryMenuExpanded },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                OutlinedTextField( // Zmienione na OutlinedTextField dla spójności
+            ExposedDropdownMenuBox(expanded = categoryMenuExpanded, onExpandedChange = { categoryMenuExpanded = !categoryMenuExpanded }, modifier = Modifier.fillMaxWidth()) {
+                OutlinedTextField(
                     value = selectedCategory ?: "Wybierz kategorię",
                     onValueChange = {},
                     readOnly = true,
@@ -173,14 +270,14 @@ fun AddEditTaskScreen(
                         )
                     },
                     modifier = Modifier
-                        .menuAnchor() // Ważne dla ExposedDropdownMenuBox
+                        .menuAnchor()
                         .fillMaxWidth()
-                        .clickable { categoryMenuExpanded = !categoryMenuExpanded } // Klikalność na całym polu
+                        .clickable { categoryMenuExpanded = !categoryMenuExpanded }
                 )
                 ExposedDropdownMenu(
                     expanded = categoryMenuExpanded,
                     onDismissRequest = { categoryMenuExpanded = false },
-                    modifier = Modifier.fillMaxWidth() // Aby menu miało szerokość pola
+                    modifier = Modifier.fillMaxWidth()
                 ) {
                     allAvailableCategories.forEach { categoryOption ->
                         DropdownMenuItem(
@@ -201,90 +298,134 @@ fun AddEditTaskScreen(
                     )
                 }
             }
-
-
             Spacer(modifier = Modifier.height(16.dp))
-            ExecutionDateTimePicker(
-                executionTime = executionTime,
-                onDateTimeSelected = { executionTime = it }
-            )
+            ExecutionDateTimePicker(executionTime = executionTime, onDateTimeSelected = { executionTime = it })
             Spacer(modifier = Modifier.height(16.dp))
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier.fillMaxWidth()
-            ) {
+
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
                 Text("Powiadomienie:")
                 Spacer(modifier = Modifier.width(8.dp))
                 Switch(
-                    checked = notificationEnabled,
-                    onCheckedChange = { notificationEnabled = it },
-                    enabled = executionTime != null
+                    checked = notificationEnabledState,
+                    onCheckedChange = { notificationEnabledState = it },
+                    enabled = executionTime != null && hasNotificationPermission
                 )
-            }
-            Spacer(modifier = Modifier.height(16.dp))
-            Text("Załączniki:", style = MaterialTheme.typography.titleMedium)
-            attachments.forEachIndexed { index, uriString ->
-                Row(
-                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.SpaceBetween
-                ) {
-                    Text("Załącznik ${index + 1}: ${Uri.parse(uriString).lastPathSegment ?: uriString}", maxLines = 1)
-                    IconButton(onClick = {
-                        attachments = attachments.toMutableList().apply { removeAt(index) }
+                Spacer(modifier = Modifier.width(8.dp))
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU && !hasNotificationPermission && executionTime != null) {
+                    TextButton(onClick = {
+                        val intent = Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).apply {
+                            putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                        }
+                        context.startActivity(intent)
                     }) {
-                        Icon(Icons.Filled.Clear, "Usuń załącznik")
+                        Text("Włącz powiadomienia")
                     }
                 }
             }
+
+            Spacer(modifier = Modifier.height(16.dp))
+            Text("Załączniki:", style = MaterialTheme.typography.titleMedium)
+            Column(modifier = Modifier.fillMaxWidth()) {
+                attachments.forEachIndexed { index, internalFileName ->
+                    val internalFile = File(File(context.filesDir, "attachments"), internalFileName)
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp)
+                            .clickable {
+                                if (internalFile.exists()) {
+                                    val uri = FileProvider.getUriForFile(context, "${context.packageName}.provider", internalFile)
+                                    val intent = Intent(Intent.ACTION_VIEW).apply {
+                                        setDataAndType(uri, context.contentResolver.getType(uri))
+                                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                    try {
+                                        context.startActivity(intent)
+                                    } catch (e: ActivityNotFoundException) {
+                                        Toast.makeText(context, "Nie znaleziono aplikacji do otwarcia tego pliku.", Toast.LENGTH_SHORT).show()
+                                    } catch (e: SecurityException) {
+                                        Toast.makeText(context, "Brak uprawnień do otwarcia pliku (FileProvider).", Toast.LENGTH_LONG).show()
+                                    }
+                                } else {
+                                    Toast.makeText(context, "Plik załącznika nie istnieje: $internalFileName", Toast.LENGTH_LONG).show()
+                                    Log.e("AddEditTaskScreen", "Attachment file does not exist: ${internalFile.absolutePath}")
+                                }
+                            },
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Text(text = "Załącznik ${index + 1}: $internalFileName", maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+                        IconButton(onClick = {
+                            coroutineScope.launch(Dispatchers.IO) {
+                                if (internalFile.exists()) {
+                                    val deleted = internalFile.delete()
+                                    Log.d("AddEditTaskScreen", "Attempted to delete $internalFileName, success: $deleted")
+                                } else {
+                                    Log.w("AddEditTaskScreen", "Attempted to delete non-existent file: $internalFileName")
+                                }
+                            }
+                            val currentAttachments = attachments.toMutableList()
+                            currentAttachments.removeAt(index)
+                            attachments = currentAttachments.toList()
+                        }) {
+                            Icon(Icons.Filled.Clear, "Usuń załącznik")
+                        }
+                    }
+                }
+            }
+
             Button(onClick = { filePickerLauncher.launch("*/*") }) {
-                Icon(Icons.Filled.Attachment, contentDescription = "Dodaj załącznik")
-                Spacer(modifier = Modifier.width(8.dp))
-                Text("Dodaj Załącznik")
+                Icon(Icons.Filled.Attachment, contentDescription = "Dodaj załącznik"); Spacer(modifier = Modifier.width(8.dp)); Text("Dodaj Załącznik")
             }
             Spacer(modifier = Modifier.weight(1f))
             Button(
                 onClick = {
                     if (title.isNotBlank()) {
-                        val currentAppSettings = taskViewModel.appSettings.value
-                        val currentTime = System.currentTimeMillis()
-                        val task = if (isEditMode && taskToEdit != null) {
-                            taskToEdit!!.copy(
-                                title = title.trim(),
-                                description = description.trim().ifBlank { null },
-                                category = selectedCategory,
-                                executionTime = executionTime,
-                                notificationEnabled = notificationEnabled && executionTime != null,
-                                attachments = attachments
-                            )
-                        } else {
-                            Task(
-                                title = title.trim(),
-                                description = description.trim().ifBlank { null },
-                                creationTime = currentTime,
-                                executionTime = executionTime,
-                                isCompleted = false,
-                                notificationEnabled = notificationEnabled && executionTime != null,
-                                category = selectedCategory,
-                                attachments = attachments
-                            )
-                        }
+                        coroutineScope.launch {
+                            val currentAppSettings = taskViewModel.appSettings.value
+                            val currentTime = System.currentTimeMillis()
+                            val actualNotificationEnabled = notificationEnabledState && hasNotificationPermission
 
-                        if (isEditMode) {
-                            taskViewModel.updateTask(task)
-                        } else {
-                            taskViewModel.insertTask(task)
-                        }
+                            val taskToSave = if (isEditMode && taskToEdit != null) {
+                                taskToEdit!!.copy(
+                                    title = title.trim(), description = description.trim().ifBlank { null }, category = selectedCategory,
+                                    executionTime = executionTime, notificationEnabled = actualNotificationEnabled, attachments = attachments
+                                )
+                            } else {
+                                Task(
+                                    title = title.trim(), description = description.trim().ifBlank { null }, creationTime = currentTime,
+                                    executionTime = executionTime, isCompleted = false, notificationEnabled = actualNotificationEnabled,
+                                    category = selectedCategory, attachments = attachments
+                                )
+                            }
 
-                        if (isEditMode && taskToEdit != null) {
-                            alarmScheduler.cancelNotification(taskToEdit!!)
+                            var finalTaskForNotification = taskToSave
+
+                            if (isEditMode) {
+                                taskViewModel.updateTask(taskToSave)
+                                if (taskToEdit != null) {
+                                    alarmScheduler.cancelNotification(taskToEdit!!)
+                                }
+                            } else {
+                                val newTaskId = taskViewModel.insertTask(taskToSave)
+                                finalTaskForNotification = taskToSave.copy(id = newTaskId.toInt()) // Poprawiono
+                                Log.d("AddEditTaskScreen", "New task inserted with ID: $newTaskId. Task for notification: $finalTaskForNotification")
+                            }
+
+                            if (finalTaskForNotification.notificationEnabled &&
+                                finalTaskForNotification.executionTime != null &&
+                                finalTaskForNotification.executionTime!! > System.currentTimeMillis() &&
+                                finalTaskForNotification.id != 0) {
+                                alarmScheduler.scheduleNotification(finalTaskForNotification, currentAppSettings.notificationOffsetMinutes)
+                                Log.d("AddEditTaskScreen", "Scheduled notification for task ID: ${finalTaskForNotification.id}")
+                            } else if (!finalTaskForNotification.notificationEnabled || finalTaskForNotification.isCompleted) {
+                                alarmScheduler.cancelNotification(finalTaskForNotification) // Poprawiono
+                                Log.d("AddEditTaskScreen", "Cancelled notification for task ID: ${finalTaskForNotification.id}")
+                            }
+                            withContext(Dispatchers.Main) {
+                                navController.popBackStack()
+                            }
                         }
-                        if (task.notificationEnabled && task.executionTime != null && task.executionTime!! > System.currentTimeMillis()) {
-                            alarmScheduler.scheduleNotification(task, currentAppSettings.notificationOffsetMinutes)
-                        } else if (!task.notificationEnabled || task.isCompleted) {
-                            alarmScheduler.cancelNotification(task)
-                        }
-                        navController.popBackStack()
                     } else {
                         Toast.makeText(context, "Tytuł nie może być pusty!", Toast.LENGTH_SHORT).show()
                     }
@@ -298,61 +439,29 @@ fun AddEditTaskScreen(
 }
 
 @Composable
-fun ExecutionDateTimePicker(
-    executionTime: Long?,
-    onDateTimeSelected: (Long?) -> Unit
-) {
+fun ExecutionDateTimePicker(executionTime: Long?, onDateTimeSelected: (Long?) -> Unit) {
     val context = LocalContext.current
     val calendar = Calendar.getInstance()
     executionTime?.let { calendar.timeInMillis = it }
-
     val dateFormat = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
-
-    val timePickerDialog = TimePickerDialog(
-        context,
-        { _, hourOfDay, minute ->
-            calendar.set(Calendar.HOUR_OF_DAY, hourOfDay)
-            calendar.set(Calendar.MINUTE, minute)
-            calendar.set(Calendar.SECOND, 0) // Ustaw sekundy na 0 dla precyzji
-            calendar.set(Calendar.MILLISECOND, 0) // Ustaw milisekundy na 0
-            onDateTimeSelected(calendar.timeInMillis)
-        },
-        calendar.get(Calendar.HOUR_OF_DAY),
-        calendar.get(Calendar.MINUTE),
-        true // 24-godzinny format
-    )
-
-    val datePickerDialog = DatePickerDialog(
-        context,
-        { _, year, month, dayOfMonth ->
-            calendar.set(Calendar.YEAR, year)
-            calendar.set(Calendar.MONTH, month)
-            calendar.set(Calendar.DAY_OF_MONTH, dayOfMonth)
-            timePickerDialog.show() // Pokaż dialog czasu po wybraniu daty
-        },
-        calendar.get(Calendar.YEAR),
-        calendar.get(Calendar.MONTH),
-        calendar.get(Calendar.DAY_OF_MONTH)
-    )
-    datePickerDialog.datePicker.minDate = System.currentTimeMillis() - 1000 // Ustaw minimalną datę na dzisiaj
-
-
+    val timePickerDialog = TimePickerDialog(context, { _, hourOfDay, minute ->
+        calendar.set(Calendar.HOUR_OF_DAY, hourOfDay); calendar.set(Calendar.MINUTE, minute)
+        calendar.set(Calendar.SECOND, 0); calendar.set(Calendar.MILLISECOND, 0)
+        onDateTimeSelected(calendar.timeInMillis)
+    }, calendar.get(Calendar.HOUR_OF_DAY), calendar.get(Calendar.MINUTE), true)
+    val datePickerDialog = DatePickerDialog(context, { _, year, month, dayOfMonth ->
+        calendar.set(Calendar.YEAR, year); calendar.set(Calendar.MONTH, month); calendar.set(Calendar.DAY_OF_MONTH, dayOfMonth)
+        timePickerDialog.show()
+    }, calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH), calendar.get(Calendar.DAY_OF_MONTH))
+    datePickerDialog.datePicker.minDate = System.currentTimeMillis() - 1000
     Column(modifier = Modifier.fillMaxWidth()) {
-        Text("Termin wykonania (opcjonalnie):")
-        Spacer(modifier = Modifier.height(4.dp))
+        Text("Termin wykonania (opcjonalnie):"); Spacer(modifier = Modifier.height(4.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(
-                onClick = { datePickerDialog.show() },
-                modifier = Modifier.weight(1f)
-            ) {
-                Text(
-                    executionTime?.let { dateFormat.format(Date(it)) } ?: "Wybierz datę i godzinę"
-                )
+            OutlinedButton(onClick = { datePickerDialog.show() }, modifier = Modifier.weight(1f)) {
+                Text(executionTime?.let { dateFormat.format(Date(it)) } ?: "Wybierz datę i godzinę")
             }
             if (executionTime != null) {
-                IconButton(onClick = { onDateTimeSelected(null) }) {
-                    Icon(Icons.Filled.Clear, contentDescription = "Wyczyść termin")
-                }
+                IconButton(onClick = { onDateTimeSelected(null) }) { Icon(Icons.Filled.Clear, contentDescription = "Wyczyść termin") }
             }
         }
     }

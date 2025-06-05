@@ -30,7 +30,7 @@ private val LightColorScheme = lightColorScheme(
 @Composable
 fun TodolistTheme(
     darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = true, // Dynamic color jest dostępny na Android 12+
+    dynamicColor: Boolean = true,
     content: @Composable () -> Unit
 ) {
     val colorScheme = when {
@@ -52,7 +52,7 @@ fun TodolistTheme(
 
     MaterialTheme(
         colorScheme = colorScheme,
-        typography = Typography, // Upewnij się, że masz zdefiniowaną typografię
+        typography = Typography,
         content = content
     )
 }

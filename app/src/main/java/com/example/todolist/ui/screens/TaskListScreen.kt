@@ -6,9 +6,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.* // Importuj wszystkie potrzebne ikony
-import androidx.compose.material.icons.outlined.VisibilityOff
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.Visibility
+import androidx.compose.material.icons.outlined.VisibilityOff
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -20,6 +20,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.navigation.NavController
 import com.example.todolist.data.Task
+import com.example.todolist.ui.components.FilterTasksDialog
 import com.example.todolist.ui.navigation.Screen
 import com.example.todolist.viewmodel.TaskViewModel
 import java.text.SimpleDateFormat
@@ -34,10 +35,45 @@ fun TaskListScreen(
 ) {
     val tasks by taskViewModel.filteredAndSortedTasks.collectAsState()
     val searchQuery by taskViewModel.searchQuery.collectAsState()
-    val categoriesForFilter by taskViewModel.categoriesForTaskListFilter.collectAsState()
-    val activeListFilter by taskViewModel.activeListFilter.collectAsState()
+    val allAvailableCategories by taskViewModel.allAvailableCategories.collectAsState()
+    val activeCategoryFilters by taskViewModel.activeCategoryFilters.collectAsState()
+    val showOnlyHiddenTasks by taskViewModel.showOnlyHiddenTasks.collectAsState()
 
-    var showFilterMenu by remember { mutableStateOf(false) }
+    var showFilterDialog by remember { mutableStateOf(false) }
+    var taskToDelete by remember { mutableStateOf<Task?>(null) }
+
+    if (showFilterDialog) {
+        FilterTasksDialog(
+            allAvailableCategories = allAvailableCategories,
+            initiallySelectedCategories = activeCategoryFilters,
+            initiallyShowOnlyHidden = showOnlyHiddenTasks,
+            onDismissRequest = { showFilterDialog = false },
+            onApplyFilters = { selectedCategories, showHidden ->
+                taskViewModel.updateActiveCategoryFilters(selectedCategories)
+                taskViewModel.setShowOnlyHiddenTasks(showHidden)
+                showFilterDialog = false
+            }
+        )
+    }
+
+    taskToDelete?.let { task ->
+        AlertDialog(
+            onDismissRequest = { taskToDelete = null },
+            title = { Text("Potwierdź usunięcie") },
+            text = { Text("Czy na pewno chcesz usunąć zadanie \"${task.title}\"?") },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        taskViewModel.deleteTask(task)
+                        taskToDelete = null
+                    }
+                ) { Text("Usuń") }
+            },
+            dismissButton = {
+                TextButton(onClick = { taskToDelete = null }) { Text("Anuluj") }
+            }
+        )
+    }
 
     Scaffold(
         topBar = {
@@ -78,48 +114,8 @@ fun TaskListScreen(
                     }
                 )
                 Spacer(modifier = Modifier.width(8.dp))
-                Box {
-                    IconButton(onClick = { showFilterMenu = true }) {
-                        Icon(Icons.Filled.FilterList, contentDescription = "Filtruj")
-                    }
-                    DropdownMenu(
-                        expanded = showFilterMenu,
-                        onDismissRequest = { showFilterMenu = false }
-                    ) {
-                        DropdownMenuItem(
-                            text = { Text("Wszystkie") },
-                            onClick = {
-                                taskViewModel.setActiveListFilter(null)
-                                showFilterMenu = false
-                            },
-                            leadingIcon = if (activeListFilter == null) {
-                                { Icon(Icons.Filled.Check, contentDescription = "Wybrano wszystkie") }
-                            } else null
-                        )
-                        categoriesForFilter.forEach { category ->
-                            DropdownMenuItem(
-                                text = { Text(category) },
-                                onClick = {
-                                    taskViewModel.setActiveListFilter(category)
-                                    showFilterMenu = false
-                                },
-                                leadingIcon = if (activeListFilter == category) {
-                                    { Icon(Icons.Filled.Check, contentDescription = "Wybrano $category") }
-                                } else null
-                            )
-                        }
-                        HorizontalDivider()
-                        DropdownMenuItem(
-                            text = { Text(taskViewModel.specialFilterUkryte) },
-                            onClick = {
-                                taskViewModel.setActiveListFilter(taskViewModel.specialFilterUkryte)
-                                showFilterMenu = false
-                            },
-                            leadingIcon = if (activeListFilter == taskViewModel.specialFilterUkryte) {
-                                { Icon(Icons.Filled.Check, contentDescription = "Wybrano ukryte") }
-                            } else null
-                        )
-                    }
+                IconButton(onClick = { showFilterDialog = true }) {
+                    Icon(Icons.Filled.FilterList, contentDescription = "Filtruj")
                 }
             }
 
@@ -132,8 +128,9 @@ fun TaskListScreen(
                     item {
                         val message = when {
                             searchQuery.isNotBlank() -> "Brak zadań pasujących do wyszukiwania."
-                            activeListFilter == taskViewModel.specialFilterUkryte -> "Brak ukrytych zadań."
-                            activeListFilter != null -> "Brak zadań w kategorii \"$activeListFilter\"."
+                            showOnlyHiddenTasks && activeCategoryFilters.isNotEmpty() -> "Brak ukrytych zadań w wybranych kategoriach."
+                            showOnlyHiddenTasks -> "Brak ukrytych zadań."
+                            activeCategoryFilters.isNotEmpty() -> "Brak zadań w wybranych kategoriach."
                             else -> "Brak zadań. Dodaj nowe!"
                         }
                         Text(
@@ -147,14 +144,15 @@ fun TaskListScreen(
                     items(tasks, key = { task -> task.id }) { task ->
                         TaskItem(
                             task = task,
-                            taskViewModel = taskViewModel, // Przekaż ViewModel
-                            activeFilter = activeListFilter, // Przekaż aktywny filtr
+                            taskViewModel = taskViewModel,
+                            showOnlyHiddenFilterActive = showOnlyHiddenTasks,
                             onTaskClick = {
                                 navController.navigate(Screen.EditTask.createRoute(task.id))
                             },
                             onEditTask = {
                                 navController.navigate(Screen.EditTask.createRoute(task.id))
-                            }
+                            },
+                            onDeleteRequest = { taskToDelete = task }
                         )
                         HorizontalDivider()
                     }
@@ -167,10 +165,11 @@ fun TaskListScreen(
 @Composable
 fun TaskItem(
     task: Task,
-    taskViewModel: TaskViewModel, // Dodano ViewModel
-    activeFilter: String?,      // Dodano aktywny filtr
+    taskViewModel: TaskViewModel,
+    showOnlyHiddenFilterActive: Boolean,
     onTaskClick: () -> Unit,
-    onEditTask: () -> Unit
+    onEditTask: () -> Unit,
+    onDeleteRequest: () -> Unit
 ) {
     val context = LocalContext.current
     val dateFormat = SimpleDateFormat("dd/MM/yyyy HH:mm", Locale.getDefault())
@@ -184,7 +183,7 @@ fun TaskItem(
     ) {
         Row(
             modifier = Modifier
-                .padding(horizontal = 8.dp, vertical = 12.dp) // Zmniejszony padding pionowy
+                .padding(horizontal = 8.dp, vertical = 12.dp)
                 .fillMaxWidth(),
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -192,18 +191,18 @@ fun TaskItem(
                 checked = task.isCompleted,
                 onCheckedChange = { taskViewModel.toggleTaskCompleted(task) }
             )
-            Spacer(modifier = Modifier.width(8.dp)) // Zmniejszony odstęp
+            Spacer(modifier = Modifier.width(8.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
                     text = task.title,
                     style = MaterialTheme.typography.titleMedium,
-                    textDecoration = if (task.isCompleted && activeFilter != taskViewModel.specialFilterUkryte) TextDecoration.LineThrough else TextDecoration.None
+                    textDecoration = if (task.isCompleted && !showOnlyHiddenFilterActive && !task.isIndividuallyHidden) TextDecoration.LineThrough else TextDecoration.None
                 )
                 task.description?.let {
                     Text(
                         text = it,
                         style = MaterialTheme.typography.bodySmall,
-                        maxLines = 1, // Zmniejszono do 1 linii dla opisu
+                        maxLines = 1,
                         overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis
                     )
                 }
@@ -230,32 +229,24 @@ fun TaskItem(
                     }
                 }
             }
-            Spacer(modifier = Modifier.width(4.dp)) // Zmniejszony odstęp
+            Spacer(modifier = Modifier.width(4.dp))
 
-            // Ikona ukrywania/pokazywania
             if (task.isCompleted) {
-                if (activeFilter == taskViewModel.specialFilterUkryte) { // Jesteśmy w widoku "Ukryte"
-                    IconButton(
-                        onClick = { taskViewModel.toggleIndividualHide(task) },
-                        modifier = Modifier.size(36.dp)
-                    ) {
-                        Icon(Icons.Outlined.Visibility, contentDescription = "Przywróć zadanie")
-                    }
-                } else { // Normalny widok, zadanie ukończone
-                    IconButton(
-                        onClick = { taskViewModel.toggleIndividualHide(task) },
-                        modifier = Modifier.size(36.dp)
-                    ) {
-                        Icon(Icons.Outlined.VisibilityOff, contentDescription = "Ukryj ukończone zadanie")
-                    }
+                IconButton(
+                    onClick = { taskViewModel.toggleIndividualHide(task) },
+                    modifier = Modifier.size(36.dp)
+                ) {
+                    Icon(
+                        if (task.isIndividuallyHidden) Icons.Outlined.Visibility else Icons.Outlined.VisibilityOff,
+                        contentDescription = if (task.isIndividuallyHidden) "Przywróć zadanie" else "Ukryj ukończone zadanie"
+                    )
                 }
             }
-
 
             IconButton(onClick = onEditTask, modifier = Modifier.size(36.dp)) {
                 Icon(Icons.Filled.Edit, contentDescription = "Edytuj")
             }
-            IconButton(onClick = { taskViewModel.deleteTask(task) }, modifier = Modifier.size(36.dp)) {
+            IconButton(onClick = onDeleteRequest, modifier = Modifier.size(36.dp)) {
                 Icon(Icons.Filled.Delete, contentDescription = "Usuń")
             }
         }

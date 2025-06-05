@@ -1,15 +1,16 @@
 package com.example.todolist.ui.navigation
 
 import androidx.compose.runtime.Composable
+import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
-import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.example.todolist.ui.screens.AddEditTaskScreen
 import com.example.todolist.ui.screens.SettingsScreen
 import com.example.todolist.ui.screens.TaskListScreen
 import com.example.todolist.viewmodel.TaskViewModel
+import androidx.navigation.navDeepLink
 
 sealed class Screen(val route: String) {
     object TaskList : Screen("taskList")
@@ -20,11 +21,18 @@ sealed class Screen(val route: String) {
         }
     }
     object Settings : Screen("settings")
+
+    companion object {
+        const val DEEP_LINK_URI_BASE = "app://com.example.todolist"
+    }
 }
 
 @Composable
-fun AppNavigation(taskViewModel: TaskViewModel) {
-    val navController = rememberNavController()
+fun AppNavigation(
+    navController: NavHostController,
+    taskViewModel: TaskViewModel
+) {
+
 
     NavHost(navController = navController, startDestination = Screen.TaskList.route) {
         composable(Screen.TaskList.route) {
@@ -37,18 +45,29 @@ fun AppNavigation(taskViewModel: TaskViewModel) {
             AddEditTaskScreen(
                 navController = navController,
                 taskViewModel = taskViewModel,
-                taskId = null // Dla nowego zadania taskId jest null
+                taskId = null
             )
         }
         composable(
             route = Screen.EditTask.route,
-            arguments = listOf(navArgument("taskId") { type = NavType.IntType })
+            arguments = listOf(
+                navArgument("taskId") {
+                    type = NavType.IntType
+                    // nullable = false // Domyślnie dla IntType
+                }
+            ),
+            deepLinks = listOf(
+                navDeepLink { uriPattern = "${Screen.DEEP_LINK_URI_BASE}/task/{taskId}" }
+            )
         ) { backStackEntry ->
             val taskIdFromArgs = backStackEntry.arguments?.getInt("taskId")
+            if (taskIdFromArgs == null && backStackEntry.destination.route == Screen.EditTask.route) {
+                android.util.Log.e("AppNavigation", "taskIdFromArgs is null for EditTask route!")
+            }
             AddEditTaskScreen(
                 navController = navController,
                 taskViewModel = taskViewModel,
-                taskId = taskIdFromArgs // Przekaż pobrane taskId
+                taskId = taskIdFromArgs
             )
         }
         composable(Screen.Settings.route) {

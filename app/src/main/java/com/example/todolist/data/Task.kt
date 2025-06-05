@@ -16,6 +16,6 @@ data class Task(
     var isCompleted: Boolean = false,
     var notificationEnabled: Boolean = false,
     var category: String?,
-    var attachments: List<String> = emptyList(), // Lista URI jako String
-    var isIndividuallyHidden: Boolean = false // Nowe pole do ukrywania pojedynczych zadań
+    var attachments: List<String> = emptyList(),
+    var isIndividuallyHidden: Boolean = false
 )

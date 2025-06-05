@@ -19,7 +19,7 @@ import androidx.compose.ui.window.Dialog
 fun AddCategoryDialog(
     onDismissRequest: () -> Unit,
     onConfirm: (String) -> Unit,
-    existingCategories: List<String> // Dodane do walidacji duplikatów
+    existingCategories: List<String>
 ) {
     var categoryName by remember { mutableStateOf("") }
     var errorMessage by remember { mutableStateOf<String?>(null) }
@@ -36,7 +36,7 @@ fun AddCategoryDialog(
                     value = categoryName,
                     onValueChange = {
                         categoryName = it
-                        errorMessage = null // Wyczyść błąd przy zmianie tekstu
+                        errorMessage = null
                     },
                     label = { Text("Nazwa kategorii") },
                     singleLine = true,
@@ -48,7 +48,7 @@ fun AddCategoryDialog(
                         text = it,
                         color = MaterialTheme.colorScheme.error,
                         style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.padding(start = 0.dp, top = 4.dp) // Usunięto padding start
+                        modifier = Modifier.padding(start = 0.dp, top = 4.dp)
                     )
                 }
                 Spacer(modifier = Modifier.height(24.dp))
@@ -62,7 +62,7 @@ fun AddCategoryDialog(
                         Text("Anuluj")
                     }
                     Spacer(modifier = Modifier.width(8.dp))
-                    Button( // Zmienione na Button dla większej wyrazistości
+                    Button(
                         onClick = {
                             val trimmedName = categoryName.trim()
                             if (trimmedName.isBlank()) {

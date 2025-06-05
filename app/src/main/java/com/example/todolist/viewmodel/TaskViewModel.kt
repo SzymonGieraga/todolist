@@ -1,40 +1,64 @@
 package com.example.todolist.viewmodel
 
 import android.app.Application
+import android.content.Context
 import androidx.lifecycle.*
 import com.example.todolist.data.*
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
-// kotlinx.coroutines.flow.combine jest już importowane przez kotlinx.coroutines.flow.*
+import kotlinx.coroutines.withContext
+import java.io.File
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class TaskViewModel(application: Application) : AndroidViewModel(application) {
     private val taskDao: TaskDao = AppDatabase.getDatabase(application).taskDao()
     val settingsRepository: SettingsRepository = SettingsRepository(application)
+    private val appContext = application.applicationContext
 
     private val _searchQuery = MutableStateFlow("")
     val searchQuery: StateFlow<String> = _searchQuery.asStateFlow()
 
-    private val _activeListFilter = MutableStateFlow<String?>(null)
-    val activeListFilter: StateFlow<String?> = _activeListFilter.asStateFlow()
+    private val _activeCategoryFilters = MutableStateFlow<Set<String>>(emptySet())
+    val activeCategoryFilters: StateFlow<Set<String>> = _activeCategoryFilters.asStateFlow()
 
-    val specialFilterUkryte = "Ukryte"
+    private val _showOnlyHiddenTasks = MutableStateFlow(false)
+    val showOnlyHiddenTasks: StateFlow<Boolean> = _showOnlyHiddenTasks.asStateFlow()
+
+    val appSettings: StateFlow<AppSettings> = settingsRepository.appSettingsFlow
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5000L), // Dodano L dla Long
+            initialValue = AppSettings(false, 15, emptySet(), emptySet(), false)
+        )
+
+    init {
+        viewModelScope.launch {
+            appSettings.collectLatest { settings ->
+                _activeCategoryFilters.value = settings.persistedActiveCategoryFilters
+                _showOnlyHiddenTasks.value = settings.persistedShowOnlyHiddenTasks
+            }
+        }
+    }
 
     fun setSearchQuery(query: String) {
         _searchQuery.value = query
     }
 
-    fun setActiveListFilter(filter: String?) {
-        _activeListFilter.value = filter
+    fun updateActiveCategoryFilters(selectedCategories: Set<String>) {
+        _activeCategoryFilters.value = selectedCategories
+        viewModelScope.launch {
+            settingsRepository.updatePersistedActiveCategoryFilters(selectedCategories)
+        }
     }
 
-    val appSettings: StateFlow<AppSettings> = settingsRepository.appSettingsFlow
-        .stateIn(
-            scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
-            initialValue = AppSettings(emptySet(), 15, emptySet())
-        )
+    fun setShowOnlyHiddenTasks(showHidden: Boolean) {
+        _showOnlyHiddenTasks.value = showHidden
+        viewModelScope.launch {
+            settingsRepository.updatePersistedShowOnlyHiddenTasks(showHidden)
+        }
+    }
 
     val allAvailableCategories: StateFlow<List<String>> = appSettings
         .map { settings ->
@@ -44,73 +68,87 @@ class TaskViewModel(application: Application) : AndroidViewModel(application) {
         }
         .stateIn(
             scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed(5000),
+            started = SharingStarted.WhileSubscribed(5000L),
             initialValue = settingsRepository.predefinedCategories.sorted()
         )
 
     val filteredAndSortedTasks: StateFlow<List<Task>> =
         combine(
             taskDao.getAllTasks(),
-            _activeListFilter,
+            appSettings,
+            _activeCategoryFilters,
+            _showOnlyHiddenTasks,
             _searchQuery
-        ) { tasks, activeFilter, query ->
+        ) { tasks, settings, categoryFilters, uiShowOnlyHidden, query ->
             tasks
                 .filter { task ->
-                    if (activeFilter == specialFilterUkryte) {
+                    if (uiShowOnlyHidden) {
                         if (!task.isIndividuallyHidden) return@filter false
+                        if (categoryFilters.isNotEmpty()) {
+                            val taskCategory = task.category ?: "Bez kategorii"
+                            if (!categoryFilters.any { it.equals(taskCategory, ignoreCase = true) }) return@filter false
+                        }
                     } else {
                         if (task.isIndividuallyHidden) return@filter false
-                        if (activeFilter != null) {
+                        if (settings.hideCompletedTasks && task.isCompleted) return@filter false
+
+
+                        if (categoryFilters.isNotEmpty()) {
                             val taskCategory = task.category ?: "Bez kategorii"
-                            if (!taskCategory.equals(activeFilter, ignoreCase = true)) return@filter false
+                            if (!categoryFilters.any { it.equals(taskCategory, ignoreCase = true) }) return@filter false
                         }
                     }
-                    val filterSearch = query.isBlank() ||
+                    // Filtr wyszukiwania
+                    query.isBlank() ||
                             task.title.contains(query, ignoreCase = true) ||
                             (task.description?.contains(query, ignoreCase = true) == true)
-                    filterSearch
                 }
                 .sortedWith(
                     compareBy(nullsLast()) { it.executionTime }
                 )
         }.stateIn(
             scope = viewModelScope,
-            started = SharingStarted.WhileSubscribed( 5000),
+            started = SharingStarted.WhileSubscribed(5000L),
             initialValue = emptyList()
         )
-
-    val categoriesForTaskListFilter: StateFlow<List<String>> =
-        combine(taskDao.getAllTasks(), appSettings) { tasks, settings ->
-            val categoriesFromTasks = tasks.mapNotNull { it.category }.distinct()
-            (settingsRepository.predefinedCategories + settings.userDefinedCategories + categoriesFromTasks)
-                .distinctBy { it.lowercase() }
-                .sorted()
-        }
-            .stateIn(
-                scope = viewModelScope,
-                started = SharingStarted.WhileSubscribed(5000),
-                initialValue = settingsRepository.predefinedCategories.sorted()
-            )
 
     fun getTaskById(taskId: Int): StateFlow<Task?> {
         return taskDao.getTaskById(taskId)
             .stateIn(
                 scope = viewModelScope,
-                started = SharingStarted.WhileSubscribed(5000),
+                started = SharingStarted.WhileSubscribed(5000L),
                 initialValue = null
             )
     }
 
-    fun insertTask(task: Task) = viewModelScope.launch {
-        taskDao.insertTask(task)
+    suspend fun insertTask(task: Task): Long {
+        return taskDao.insertTask(task)
     }
 
-    fun updateTask(task: Task) = viewModelScope.launch {
-        taskDao.updateTask(task)
-    }
+    fun updateTask(task: Task) = viewModelScope.launch { taskDao.updateTask(task) }
 
     fun deleteTask(task: Task) = viewModelScope.launch {
+        deleteAttachmentsForTask(task.attachments, appContext)
         taskDao.deleteTask(task)
+    }
+
+    private suspend fun deleteAttachmentsForTask(attachmentFileNames: List<String>, context: Context) {
+        if (attachmentFileNames.isEmpty()) return
+        withContext(Dispatchers.IO) {
+            val attachmentsDir = File(context.filesDir, "attachments")
+            if (attachmentsDir.exists() && attachmentsDir.isDirectory) {
+                attachmentFileNames.forEach { fileName ->
+                    try {
+                        val fileToDelete = File(attachmentsDir, fileName)
+                        if (fileToDelete.exists() && fileToDelete.isFile) {
+                            fileToDelete.delete()
+                        }
+                    } catch (e: Exception) {
+                        e.printStackTrace()
+                    }
+                }
+            }
+        }
     }
 
     fun toggleTaskCompleted(task: Task) = viewModelScope.launch {
@@ -144,9 +182,12 @@ class TaskViewModel(application: Application) : AndroidViewModel(application) {
             settingsRepository.removeUserCategory(category)
         }
     }
+
+    fun updateHideCompletedTasks(hide: Boolean) = viewModelScope.launch {
+        settingsRepository.updateHideCompletedTasks(hide)
+    }
 }
 
-// --- DODANA KLASA FABRYKI ---
 class TaskViewModelFactory(private val application: Application) : ViewModelProvider.Factory {
     override fun <T : ViewModel> create(modelClass: Class<T>): T {
         if (modelClass.isAssignableFrom(TaskViewModel::class.java)) {

@@ -243,9 +243,6 @@ fun TaskItem(
                 }
             }
 
-            IconButton(onClick = onEditTask, modifier = Modifier.size(36.dp)) {
-                Icon(Icons.Filled.Edit, contentDescription = "Edytuj")
-            }
             IconButton(onClick = onDeleteRequest, modifier = Modifier.size(36.dp)) {
                 Icon(Icons.Filled.Delete, contentDescription = "Usuń")
             }
